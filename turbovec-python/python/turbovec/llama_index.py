@@ -5,9 +5,10 @@ Install with: ``pip install turbovec[llama-index]``.
 
 from __future__ import annotations
 
-import pickle
+import json
+import os
 from pathlib import Path
-from typing import Any
+from typing import Any, List, Optional, Sequence
 
 import numpy as np
 
@@ -24,6 +25,10 @@ try:
     )
     from llama_index.core.vector_stores.types import (
         BasePydanticVectorStore,
+        FilterCondition,
+        FilterOperator,
+        MetadataFilter,
+        MetadataFilters,
         VectorStoreQuery,
         VectorStoreQueryResult,
     )
@@ -34,8 +39,32 @@ except ImportError as exc:
     ) from exc
 
 
-_INDEX_FILENAME = "index.tvim"
-_STORE_FILENAME = "nodes.pkl"
+# Persistence layout: a single user-facing ``persist_path`` (the file the
+# framework asks us to write) is split into two files by extension —
+# ``{base}.tvim`` for the binary IdMapIndex and ``{base}.nodes.json`` for
+# the node side-car. Both live next to each other so the layout fits the
+# directory-of-namespaced-files pattern used by StorageContext.
+_INDEX_EXT = ".tvim"
+_STORE_EXT = ".nodes.json"
+# Filename template used by SimpleVectorStore for namespace lookup —
+# mirrored here so `from_persist_dir` works the same way.
+_NAMESPACE_SEP = "__"
+_DEFAULT_PERSIST_FNAME = "vector_store.json"
+_DEFAULT_VECTOR_STORE = "default"
+# Bump when the nodes.json shape changes; loader refuses to deserialize
+# unknown versions.
+_NODES_SCHEMA_VERSION = 1
+
+
+def _split_persist_base(persist_path: str | Path) -> Path:
+    """Strip the framework-provided extension off `persist_path` so the
+    binary index and JSON side-car can sit next to each other under a
+    shared base. We then append our own extensions in persist / load."""
+    p = Path(persist_path)
+    # Use the path without its suffix so both .tvim and .nodes.json share
+    # a base. If the input has no suffix (e.g. a bare folder-like name),
+    # use it as-is.
+    return p.with_suffix("") if p.suffix else p
 
 
 class TurboQuantVectorStore(BasePydanticVectorStore):
@@ -57,9 +86,21 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
     _u64_to_node_id: dict[int, str] = PrivateAttr()
     _next_u64: int = PrivateAttr()
 
-    def __init__(self, index: IdMapIndex, **kwargs: Any) -> None:
+    def __init__(self, index: IdMapIndex | None = None, *, bit_width: int = 4, **kwargs: Any) -> None:
+        """Construct the vector store.
+
+        :param index: Optional pre-built :class:`IdMapIndex`. When omitted,
+            a lazy ``IdMapIndex`` is created — it commits to a dim on the
+            first add and lets callers use the no-arg construction pattern
+            common to LlamaIndex's other vector stores (e.g. via
+            ``StorageContext.from_defaults(vector_store=TurboQuantVectorStore())``).
+        :param bit_width: Quantization width used when constructing the
+            lazy index. Ignored if ``index`` is supplied.
+        """
         super().__init__(**kwargs)
-        self._index = index
+        # IdMapIndex itself supports lazy construction now — no per-store
+        # lazy wrapping needed.
+        self._index = index if index is not None else IdMapIndex(bit_width=bit_width)
         self._nodes = {}
         self._node_id_to_u64 = {}
         self._u64_to_node_id = {}
@@ -74,7 +115,9 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         return "TurboQuantVectorStore"
 
     @classmethod
-    def from_params(cls, dim: int, bit_width: int = 4) -> "TurboQuantVectorStore":
+    def from_params(cls, dim: int | None = None, bit_width: int = 4) -> "TurboQuantVectorStore":
+        """Build a store with a known ``dim`` (eager) or lazy when ``dim``
+        is omitted."""
         return cls(index=IdMapIndex(dim, bit_width))
 
     @property
@@ -93,9 +136,17 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
 
         embeddings = [node.get_embedding() for node in nodes]
         vectors = np.asarray(embeddings, dtype=np.float32)
-        if vectors.ndim != 2 or vectors.shape[1] != self._index.dim:
+        if vectors.ndim != 2:
             raise ValueError(
-                f"node embedding dim {vectors.shape[1]} does not match index dim {self._index.dim}"
+                f"expected 2D embedding batch, got {vectors.ndim}D"
+            )
+        # IdMapIndex.add_with_ids handles eager (dim must match) and lazy
+        # (locks dim on first add) — pre-check the eager case so we
+        # surface a clean ValueError rather than a Rust panic.
+        existing_dim = self._index.dim
+        if existing_dim is not None and vectors.shape[1] != existing_dim:
+            raise ValueError(
+                f"node embedding dim {vectors.shape[1]} does not match index dim {existing_dim}"
             )
         if not vectors.flags["C_CONTIGUOUS"]:
             vectors = np.ascontiguousarray(vectors)
@@ -127,17 +178,93 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
 
     def delete_nodes(
         self,
-        node_ids: list[str],
-        filters: Any = None,
+        node_ids: Optional[List[str]] = None,
+        filters: Optional[MetadataFilters] = None,
         **_: Any,
     ) -> None:
-        """Delete specific nodes by their ``node_id``. Missing ids are ignored."""
+        """Delete every node matching ``node_ids`` and/or ``filters``. Both
+        constraints intersect when supplied. Missing node_ids are ignored.
+        Matches the signature and semantics of ``SimpleVectorStore.delete_nodes``.
+        """
+        if not node_ids and filters is None:
+            return
+        candidates = list(self._nodes.items())
+        if node_ids is not None:
+            node_id_set = set(node_ids)
+            candidates = [(nid, data) for nid, data in candidates if nid in node_id_set]
         if filters is not None:
-            raise NotImplementedError(
-                "TurboQuantVectorStore does not support metadata filtering on delete_nodes."
-            )
-        for nid in node_ids:
+            candidates = [
+                (nid, data)
+                for nid, data in candidates
+                if self._filters_match(data["metadata"], filters)
+            ]
+        for nid, _data in candidates:
             self._remove_node_by_id(nid)
+
+    def clear(self) -> None:
+        """Drop every node from the store and reset to a fresh lazy index.
+
+        The new index keeps the same ``bit_width`` so subsequent adds
+        commit a new ``dim`` lazily.
+        """
+        bw = self._index.bit_width
+        self._index = IdMapIndex(bit_width=bw)
+        self._nodes = {}
+        self._node_id_to_u64 = {}
+        self._u64_to_node_id = {}
+        self._next_u64 = 0
+
+    def get(self, text_id: str) -> List[float]:
+        """LlamaIndex's protocol expects this to return the full-precision
+        embedding for a given node id. turbovec discards full-precision
+        embeddings after quantization, so we raise loudly with an
+        explanation rather than return a lossy reconstruction or zeroes.
+        """
+        raise NotImplementedError(
+            "TurboQuantVectorStore.get(text_id) cannot return the original "
+            "embedding because turbovec quantizes vectors to 2-4 bits per "
+            "dimension and discards full precision after encoding. Keep a "
+            "parallel docstore if you need the raw embedding."
+        )
+
+    def get_nodes(
+        self,
+        node_ids: Optional[List[str]] = None,
+        filters: Optional[MetadataFilters] = None,
+    ) -> List[BaseNode]:
+        """Return the nodes matching ``node_ids`` and/or ``filters``. Both
+        constraints intersect when supplied; missing node_ids are
+        silently skipped.
+
+        Unlike ``SimpleVectorStore`` (which raises NotImplementedError
+        here because it doesn't store nodes), turbovec keeps node text
+        and metadata in a side-car so this can return populated
+        ``TextNode`` objects directly.
+        """
+        candidates = list(self._nodes.items())
+        if node_ids is not None:
+            node_id_set = set(node_ids)
+            candidates = [(nid, data) for nid, data in candidates if nid in node_id_set]
+        if filters is not None:
+            candidates = [
+                (nid, data)
+                for nid, data in candidates
+                if self._filters_match(data["metadata"], filters)
+            ]
+        return [self._reconstruct_node(nid, data) for nid, data in candidates]
+
+    @staticmethod
+    def _reconstruct_node(nid: str, data: dict[str, Any]) -> TextNode:
+        node = TextNode(
+            id_=nid,
+            text=data["text"],
+            metadata=dict(data["metadata"]),
+        )
+        if data.get("ref_doc_id") is not None:
+            node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
+                node_id=data["ref_doc_id"]
+            )
+        return node
 
     def _remove_node_by_id(self, node_id: str) -> bool:
         handle = self._node_id_to_u64.pop(node_id, None)
@@ -147,6 +274,109 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         self._nodes.pop(node_id, None)
         self._index.remove(handle)
         return True
+
+    def _resolve_allowed_handles(
+        self,
+        filters: MetadataFilters | None,
+        node_ids: list[str] | None,
+        doc_ids: list[str] | None,
+    ) -> list[int]:
+        """Resolve ``query.filters``, ``query.node_ids`` and ``query.doc_ids``
+        to the list of internal u64 handles that satisfy the filter. Empty
+        list means no node matches.
+
+        Semantics (matching the SimpleVectorStore reference where applicable):
+          - ``node_ids``: filter by node_id (set membership).
+          - ``doc_ids``: filter by ``ref_doc_id`` only (source document id).
+          - ``filters``: apply metadata filters.
+        All three intersect when more than one is supplied.
+        """
+        candidates = self._nodes.items()
+
+        if node_ids:
+            node_id_set = set(node_ids)
+            candidates = [(nid, data) for nid, data in candidates if nid in node_id_set]
+
+        if doc_ids:
+            doc_id_set = set(doc_ids)
+            candidates = [
+                (nid, data)
+                for nid, data in candidates
+                if data.get("ref_doc_id") in doc_id_set
+            ]
+
+        if filters is None:
+            return [self._node_id_to_u64[nid] for nid, _ in candidates]
+
+        return [
+            self._node_id_to_u64[nid]
+            for nid, data in candidates
+            if self._filters_match(data["metadata"], filters)
+        ]
+
+    @classmethod
+    def _filters_match(
+        cls, metadata: dict[str, Any], filters: MetadataFilters
+    ) -> bool:
+        condition = getattr(filters, "condition", None) or FilterCondition.AND
+        results: list[bool] = []
+        for f in filters.filters:
+            if isinstance(f, MetadataFilters):
+                results.append(cls._filters_match(metadata, f))
+            else:
+                results.append(cls._single_filter_match(metadata, f))
+        if condition == FilterCondition.AND:
+            return all(results) if results else True
+        if condition == FilterCondition.OR:
+            return any(results) if results else True
+        raise NotImplementedError(
+            f"filter condition {condition!r} not supported by TurboQuantVectorStore "
+            "(supported: AND, OR)"
+        )
+
+    @staticmethod
+    def _single_filter_match(metadata: dict[str, Any], f: MetadataFilter) -> bool:
+        # Semantics mirror SimpleVectorStore's _build_metadata_filter_fn
+        # (llama_index/core/vector_stores/simple.py) so that filtered
+        # results agree with the in-tree reference store.
+        op = f.operator
+        target = f.value
+        value = metadata.get(f.key)
+
+        # IS_EMPTY is the only operator that treats a missing key as a hit.
+        if op == FilterOperator.IS_EMPTY:
+            return value is None or value == "" or value == []
+
+        # Every other operator returns False when the key is absent — this
+        # matches the reference implementation (notably NE returns False on
+        # missing, not True).
+        if value is None:
+            return False
+
+        if op == FilterOperator.EQ:
+            return value == target
+        if op == FilterOperator.NE:
+            return value != target
+        if op == FilterOperator.GT:
+            return value > target
+        if op == FilterOperator.LT:
+            return value < target
+        if op == FilterOperator.GTE:
+            return value >= target
+        if op == FilterOperator.LTE:
+            return value <= target
+        if op == FilterOperator.IN:
+            return value in target
+        if op == FilterOperator.NIN:
+            return value not in target
+        if op == FilterOperator.TEXT_MATCH:
+            # Case-insensitive, like the reference impl.
+            return str(target).lower() in str(value).lower()
+        if op == FilterOperator.CONTAINS:
+            return target in value
+        raise NotImplementedError(
+            f"filter operator {op!r} not supported by TurboQuantVectorStore"
+        )
 
     def query(self, query: VectorStoreQuery, **_: Any) -> VectorStoreQueryResult:
         if query.query_embedding is None:
@@ -160,75 +390,185 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         if not qvec.flags["C_CONTIGUOUS"]:
             qvec = np.ascontiguousarray(qvec)
 
-        k = min(query.similarity_top_k, len(self._index))
-        if k == 0:
+        if len(self._index) == 0:
             return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
 
-        scores, handles = self._index.search(qvec, k)
+        has_filters = (
+            query.filters is not None
+            or bool(query.node_ids)
+            or bool(query.doc_ids)
+        )
+        if not has_filters:
+            k = min(query.similarity_top_k, len(self._index))
+            scores, handles = self._index.search(qvec, k)
+        else:
+            allowed_handles = self._resolve_allowed_handles(
+                query.filters, query.node_ids, query.doc_ids
+            )
+            if not allowed_handles:
+                return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
+            allowlist = np.asarray(allowed_handles, dtype=np.uint64)
+            scores, handles = self._index.search(
+                qvec, query.similarity_top_k, allowlist=allowlist
+            )
 
         result_nodes: list[TextNode] = []
         similarities: list[float] = []
         ids: list[str] = []
         for score, handle in zip(scores[0], handles[0]):
             nid = self._u64_to_node_id[int(handle)]
-            state = self._nodes[nid]
-            node = TextNode(
-                id_=nid,
-                text=state["text"],
-                metadata=dict(state["metadata"]),
-            )
-            if state["ref_doc_id"] is not None:
-                node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
-                    node_id=state["ref_doc_id"]
-                )
-            result_nodes.append(node)
+            data = self._nodes[nid]
+            result_nodes.append(self._reconstruct_node(nid, data))
             similarities.append(float(score))
             ids.append(nid)
 
         return VectorStoreQueryResult(nodes=result_nodes, similarities=similarities, ids=ids)
 
+    # ---- Async overrides --------------------------------------------------
+    #
+    # The base class provides default async impls that delegate to sync via
+    # `return self.<sync>(...)`. We override them explicitly so the signature
+    # is visible on the class and an autodoc tool / IDE doesn't make
+    # callers chase the abstract base class for the documentation.
+
+    async def async_add(
+        self, nodes: Sequence[BaseNode], **kwargs: Any
+    ) -> List[str]:
+        return self.add(list(nodes), **kwargs)
+
+    async def adelete(self, ref_doc_id: str, **kwargs: Any) -> None:
+        self.delete(ref_doc_id, **kwargs)
+
+    async def adelete_nodes(
+        self,
+        node_ids: Optional[List[str]] = None,
+        filters: Optional[MetadataFilters] = None,
+        **kwargs: Any,
+    ) -> None:
+        self.delete_nodes(node_ids=node_ids, filters=filters, **kwargs)
+
+    async def aclear(self) -> None:
+        self.clear()
+
+    async def aquery(
+        self, query: VectorStoreQuery, **kwargs: Any
+    ) -> VectorStoreQueryResult:
+        return self.query(query, **kwargs)
+
+    async def aget_nodes(
+        self,
+        node_ids: Optional[List[str]] = None,
+        filters: Optional[MetadataFilters] = None,
+    ) -> List[BaseNode]:
+        return self.get_nodes(node_ids=node_ids, filters=filters)
+
+    # ---- Config serialization ---------------------------------------------
+
+    def to_dict(self, **_: Any) -> dict[str, Any]:
+        """Serialize the store's *configuration* (not its data) so a
+        fresh instance can be reconstructed via ``from_dict``. Mirrors
+        the contract of ``SimpleVectorStore.to_dict`` — config-only;
+        node data round-trips through ``persist`` / ``from_persist_path``.
+        """
+        return {
+            "bit_width": self._index.bit_width,
+            "dim": self._index.dim,  # may be None (lazy uncommitted)
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], **_: Any) -> "TurboQuantVectorStore":
+        """Construct an empty store from a config dict produced by
+        ``to_dict``. To restore data, use ``from_persist_path``."""
+        dim = data.get("dim")
+        bit_width = data.get("bit_width", 4)
+        return cls(index=IdMapIndex(dim, bit_width))
+
     def persist(self, persist_path: str, fs: Any = None) -> None:
+        """Persist the store. ``persist_path`` is treated as a path *stem*:
+        the binary index goes to ``{stem}.tvim`` and the node side-car to
+        ``{stem}.nodes.json``. Any extension on ``persist_path`` (e.g.
+        ``.json`` from a StorageContext default) is replaced.
+
+        This matches the layout assumed by ``StorageContext.persist`` —
+        which calls us with ``persist_path = {persist_dir}/{namespace}__vector_store.json`` —
+        and lets multiple namespaced stores coexist in the same directory.
+
+        Node metadata must be JSON-serializable (same constraint as
+        ``SimpleVectorStore``). ``fs`` (fsspec) is not yet supported;
+        pass a local path.
+        """
         if fs is not None:
-            raise NotImplementedError("fsspec filesystems are not supported yet; pass a local path.")
-        folder = Path(persist_path)
-        folder.mkdir(parents=True, exist_ok=True)
-        self._index.write(str(folder / _INDEX_FILENAME))
-        with open(folder / _STORE_FILENAME, "wb") as f:
-            pickle.dump(
-                {
-                    "nodes": self._nodes,
-                    "node_id_to_u64": self._node_id_to_u64,
-                    "next_u64": self._next_u64,
-                },
-                f,
+            raise NotImplementedError(
+                "fsspec filesystems are not supported yet; pass a local path."
             )
+        base = _split_persist_base(persist_path)
+        base.parent.mkdir(parents=True, exist_ok=True)
+        self._index.write(str(base.with_suffix(_INDEX_EXT)))
+        payload = {
+            "schema_version": _NODES_SCHEMA_VERSION,
+            "nodes": self._nodes,
+            # JSON object keys must be strings; round-trip int keys via
+            # an explicit list of [node_id, handle] pairs to preserve
+            # type fidelity.
+            "node_id_to_u64": list(self._node_id_to_u64.items()),
+            "next_u64": self._next_u64,
+        }
+        with open(base.with_suffix(_STORE_EXT), "w") as f:
+            json.dump(payload, f)
 
     @classmethod
     def from_persist_path(
         cls,
         persist_path: str,
         fs: Any = None,
-        *,
-        allow_dangerous_deserialization: bool = False,
     ) -> "TurboQuantVectorStore":
+        """Load a previously-persisted store. ``persist_path`` is the same
+        path that was passed to :meth:`persist` (extension is ignored;
+        ``{stem}.tvim`` and ``{stem}.nodes.json`` are read).
+
+        Safe to call on any path — the side-car is plain JSON, never
+        pickle, so there's no deserialization-of-code risk.
+        """
         if fs is not None:
-            raise NotImplementedError("fsspec filesystems are not supported yet; pass a local path.")
-        if not allow_dangerous_deserialization:
-            raise ValueError(
-                "from_persist_path uses pickle to deserialize the node store, which is "
-                "unsafe with untrusted input. Pass allow_dangerous_deserialization=True "
-                "to confirm you trust the source of persist_path."
+            raise NotImplementedError(
+                "fsspec filesystems are not supported yet; pass a local path."
             )
-        folder = Path(persist_path)
-        index = IdMapIndex.load(str(folder / _INDEX_FILENAME))
-        with open(folder / _STORE_FILENAME, "rb") as f:
-            state = pickle.load(f)
+        base = _split_persist_base(persist_path)
+        index = IdMapIndex.load(str(base.with_suffix(_INDEX_EXT)))
+        with open(base.with_suffix(_STORE_EXT)) as f:
+            state = json.load(f)
+        version = state.get("schema_version", 0)
+        if version != _NODES_SCHEMA_VERSION:
+            raise ValueError(
+                f"{_STORE_EXT.lstrip('.')} has schema version {version}; "
+                f"this turbovec expects version {_NODES_SCHEMA_VERSION}"
+            )
         store = cls(index=index)
         store._nodes = state["nodes"]
-        store._node_id_to_u64 = state["node_id_to_u64"]
-        store._u64_to_node_id = {h: nid for nid, h in state["node_id_to_u64"].items()}
-        store._next_u64 = state["next_u64"]
+        # Reconstruct {node_id: int handle} from the list-of-pairs form.
+        store._node_id_to_u64 = {nid: int(h) for nid, h in state["node_id_to_u64"]}
+        store._u64_to_node_id = {h: nid for nid, h in store._node_id_to_u64.items()}
+        store._next_u64 = int(state["next_u64"])
         return store
+
+    @classmethod
+    def from_persist_dir(
+        cls,
+        persist_dir: str,
+        namespace: str = _DEFAULT_VECTOR_STORE,
+        fs: Any = None,
+    ) -> "TurboQuantVectorStore":
+        """Load a store from a ``StorageContext``-style persist directory.
+
+        Builds the namespaced filename
+        ``{persist_dir}/{namespace}__vector_store.json`` and forwards to
+        :meth:`from_persist_path`. The ``.json`` suffix is conventional —
+        our actual on-disk files use ``.tvim`` and ``.pkl`` extensions
+        derived from the same stem.
+        """
+        persist_fname = f"{namespace}{_NAMESPACE_SEP}{_DEFAULT_PERSIST_FNAME}"
+        persist_path = os.path.join(persist_dir, persist_fname)
+        return cls.from_persist_path(persist_path, fs=fs)
 
 
 __all__ = ["TurboQuantVectorStore"]

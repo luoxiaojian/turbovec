@@ -17,6 +17,7 @@ turbovec is a Rust vector index with Python bindings, built on Google Research's
 
 - **No codebook training.** Add vectors, they're indexed. No data-dependent calibration, no rebuilds as the corpus grows.
 - **Faster than FAISS.** Hand-written NEON (ARM) and AVX-512BW (x86) kernels beat FAISS IndexPQFastScan by 12–20% on ARM and match-or-beat it on x86.
+- **Filter at search time.** Pass an id allowlist (or a slot bitmask) to `search()` and the kernel honours it directly. You always get up to `k` results from the allowed set — no over-fetching, no recall hit on selective filters.
 - **Pure local.** No managed service, no data leaving your machine or VPC. Pair with any open-source embedding model for a fully air-gapped RAG stack.
 
 Building RAG where privacy, memory, or latency matters? **You're in the right place.**
@@ -56,13 +57,36 @@ index.write("my_index.tvim")
 loaded = IdMapIndex.load("my_index.tvim")
 ```
 
+### Hybrid retrieval (filtered search)
+
+Restrict results to a candidate set produced by another system (SQL, BM25, ACL, time window, …):
+
+```python
+import numpy as np
+from turbovec import IdMapIndex
+
+idx = IdMapIndex(dim=1536, bit_width=4)
+idx.add_with_ids(vectors, ids)
+
+# Stage 1: external system narrows to candidate ids.
+allowed = np.array(db.execute("SELECT id FROM docs WHERE tenant=?", (t,)).fetchall(),
+                   dtype=np.uint64)
+
+# Stage 2: dense rerank within the candidate set.
+scores, ids = idx.search(query, k=10, allowlist=allowed)
+```
+
+The kernel only inserts allowed vectors into the per-query heap, so `len(allowed) < k` shrinks the output to `len(allowed)` rather than returning fewer than `k` valid results.
+
 See [`docs/api.md`](docs/api.md) for the full reference.
 
 ### Framework integrations
 
-- [LangChain](docs/integrations/langchain.md) — `pip install turbovec[langchain]`
-- [LlamaIndex](docs/integrations/llama_index.md) — `pip install turbovec[llama-index]`
-- [Haystack](docs/integrations/haystack.md) — `pip install turbovec[haystack]`
+Drop-in replacements for the in-tree reference vector / document stores in each framework. Same public surface, same persistence semantics, same retriever and pipeline wiring — swap the import and keep your pipeline.
+
+- [LangChain](docs/integrations/langchain.md) — `pip install turbovec[langchain]` · replaces `langchain_core.vectorstores.InMemoryVectorStore`
+- [LlamaIndex](docs/integrations/llama_index.md) — `pip install turbovec[llama-index]` · replaces `llama_index.core.vector_stores.SimpleVectorStore`
+- [Haystack](docs/integrations/haystack.md) — `pip install turbovec[haystack]` · replaces `haystack.document_stores.in_memory.InMemoryDocumentStore`
 
 ## Rust
 

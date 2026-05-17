@@ -6,7 +6,13 @@ import pytest
 pytest.importorskip("llama_index.core")
 
 from llama_index.core.schema import NodeRelationship, RelatedNodeInfo, TextNode
-from llama_index.core.vector_stores.types import VectorStoreQuery
+from llama_index.core.vector_stores.types import (
+    FilterCondition,
+    FilterOperator,
+    MetadataFilter,
+    MetadataFilters,
+    VectorStoreQuery,
+)
 
 from turbovec import IdMapIndex
 from turbovec.llama_index import TurboQuantVectorStore
@@ -33,6 +39,46 @@ def test_from_params_creates_index():
     assert store._index.bit_width == 4
     assert store.stores_text is True
     assert store.is_embedding_query is True
+
+
+# ---- Lazy index construction --------------------------------------------
+
+def test_constructor_no_index_is_lazy():
+    # No-arg construction yields a lazy-uncommitted IdMapIndex.
+    store = TurboQuantVectorStore()
+    assert store._index.dim is None
+    # Query before any add returns an empty result.
+    result = store.query(
+        VectorStoreQuery(query_embedding=_unit_vec(0, 64), similarity_top_k=3)
+    )
+    assert result.nodes == []
+    assert result.similarities == []
+    assert result.ids == []
+
+
+def test_lazy_dim_locked_on_first_add():
+    store = TurboQuantVectorStore(bit_width=2)
+    store.add([_make_node("x", seed=0)])
+    assert store._index.dim == 64
+    assert store._index.bit_width == 2
+
+
+def test_from_params_without_dim_is_lazy():
+    store = TurboQuantVectorStore.from_params(bit_width=4)
+    assert store._index.dim is None
+
+
+def test_persist_and_load_lazy_uncommitted_store(tmp_path):
+    # A store that's never seen an add must round-trip through persist
+    # without committing a dim or losing its bit_width.
+    store = TurboQuantVectorStore(bit_width=2)
+    persist_path = tmp_path / "lazy_store.json"
+    store.persist(str(persist_path))
+    loaded = TurboQuantVectorStore.from_persist_path(str(persist_path))
+    assert loaded._index.dim is None
+    assert loaded._index.bit_width == 2
+    loaded.add([_make_node("post-load", seed=0)])
+    assert loaded._index.dim == 64
 
 
 def test_add_and_query_returns_nodes():
@@ -111,21 +157,40 @@ def test_persist_and_from_persist_path_roundtrip(tmp_path):
         _make_node("three", seed=3, metadata={"n": 3}),
     ]
     store.add(nodes)
-    store.persist(str(tmp_path))
+    persist_path = tmp_path / "store.json"
+    store.persist(str(persist_path))
 
-    loaded = TurboQuantVectorStore.from_persist_path(
-        str(tmp_path), allow_dangerous_deserialization=True
-    )
+    loaded = TurboQuantVectorStore.from_persist_path(str(persist_path))
     result = loaded.query(VectorStoreQuery(query_embedding=_unit_vec(1, 64), similarity_top_k=3))
     assert {n.get_content() for n in result.nodes} == {"one", "two", "three"}
 
 
-def test_from_persist_path_refuses_without_flag(tmp_path):
+def test_from_persist_dir_loads_default_namespace(tmp_path):
+    # StorageContext-style: a directory containing a namespaced filename.
     store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
-    store.add([_make_node("x", seed=1)])
-    store.persist(str(tmp_path))
-    with pytest.raises(ValueError, match="allow_dangerous_deserialization"):
-        TurboQuantVectorStore.from_persist_path(str(tmp_path))
+    nodes = [_make_node(f"doc {i}", seed=i) for i in range(3)]
+    store.add(nodes)
+    # Mimic StorageContext.persist's filename layout.
+    persist_path = tmp_path / "default__vector_store.json"
+    store.persist(str(persist_path))
+
+    loaded = TurboQuantVectorStore.from_persist_dir(str(tmp_path))
+    result = loaded.query(
+        VectorStoreQuery(query_embedding=_unit_vec(0, 64), similarity_top_k=3)
+    )
+    assert len(result.nodes) == 3
+
+
+def test_from_persist_dir_with_custom_namespace(tmp_path):
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    store.add([_make_node("ns-doc", seed=0)])
+    persist_path = tmp_path / "custom-ns__vector_store.json"
+    store.persist(str(persist_path))
+
+    loaded = TurboQuantVectorStore.from_persist_dir(
+        str(tmp_path), namespace="custom-ns"
+    )
+    assert len(loaded._nodes) == 1
 
 
 def test_delete_by_ref_doc_id_removes_every_matching_node():
@@ -175,3 +240,461 @@ def test_add_upsert_replaces_same_node_id():
     assert len(store._index) == 1
     result = store.query(VectorStoreQuery(query_embedding=_unit_vec(2, 64), similarity_top_k=1))
     assert result.nodes[0].get_content() == "v2"
+
+
+# ------------------- Filtered query -------------------
+
+def _store_with_tiered_nodes() -> TurboQuantVectorStore:
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [
+        _make_node(f"doc {i}", seed=i, metadata={"tier": tier, "idx": i})
+        for i, tier in enumerate(["free", "pro", "free", "pro", "enterprise"])
+    ]
+    store.add(nodes)
+    return store
+
+
+def test_query_with_eq_filter():
+    store = _store_with_tiered_nodes()
+    filters = MetadataFilters(
+        filters=[MetadataFilter(key="tier", value="pro", operator=FilterOperator.EQ)]
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
+    )
+    result = store.query(q)
+    assert len(result.nodes) == 2
+    assert all(n.metadata["tier"] == "pro" for n in result.nodes)
+
+
+def test_query_with_in_filter():
+    store = _store_with_tiered_nodes()
+    filters = MetadataFilters(
+        filters=[
+            MetadataFilter(
+                key="tier", value=["pro", "enterprise"], operator=FilterOperator.IN
+            )
+        ]
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
+    )
+    result = store.query(q)
+    assert len(result.nodes) == 3
+    assert all(n.metadata["tier"] in {"pro", "enterprise"} for n in result.nodes)
+
+
+def test_query_with_and_filter():
+    store = _store_with_tiered_nodes()
+    filters = MetadataFilters(
+        filters=[
+            MetadataFilter(key="tier", value="pro", operator=FilterOperator.EQ),
+            MetadataFilter(key="idx", value=2, operator=FilterOperator.GT),
+        ],
+        condition=FilterCondition.AND,
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
+    )
+    result = store.query(q)
+    # tier=="pro" matches idx 1, 3; combined with idx > 2 leaves only idx=3.
+    assert len(result.nodes) == 1
+    assert result.nodes[0].metadata["idx"] == 3
+
+
+def test_query_with_or_filter():
+    store = _store_with_tiered_nodes()
+    filters = MetadataFilters(
+        filters=[
+            MetadataFilter(key="tier", value="enterprise", operator=FilterOperator.EQ),
+            MetadataFilter(key="idx", value=0, operator=FilterOperator.EQ),
+        ],
+        condition=FilterCondition.OR,
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
+    )
+    result = store.query(q)
+    # enterprise = idx 4, OR idx==0 → 2 nodes total.
+    assert len(result.nodes) == 2
+    idxs = {n.metadata["idx"] for n in result.nodes}
+    assert idxs == {0, 4}
+
+
+def test_query_filter_no_matches_returns_empty():
+    store = _store_with_tiered_nodes()
+    filters = MetadataFilters(
+        filters=[MetadataFilter(key="tier", value="nonexistent", operator=FilterOperator.EQ)]
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=5, filters=filters
+    )
+    result = store.query(q)
+    assert result.nodes == []
+    assert result.similarities == []
+    assert result.ids == []
+
+
+def test_query_filter_selective_returns_top_k_from_matches():
+    # 50 nodes, filter selects 3 — we must return all 3 even when top_k=3
+    # and the matching nodes wouldn't be in the unfiltered top-3.
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [
+        _make_node(f"doc {i}", seed=i, metadata={"tag": "needle" if i in (7, 23, 41) else "hay"})
+        for i in range(50)
+    ]
+    store.add(nodes)
+    filters = MetadataFilters(
+        filters=[MetadataFilter(key="tag", value="needle", operator=FilterOperator.EQ)]
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=3, filters=filters
+    )
+    result = store.query(q)
+    assert len(result.nodes) == 3
+    assert all(n.metadata["tag"] == "needle" for n in result.nodes)
+
+
+def test_query_with_node_ids_filter():
+    # `node_ids` restricts to specific node_ids — matches SimpleVectorStore's
+    # canonical behaviour.
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [_make_node(f"doc {i}", seed=i) for i in range(5)]
+    store.add(nodes)
+    keep = [nodes[1].node_id, nodes[3].node_id]
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=5, node_ids=keep
+    )
+    result = store.query(q)
+    assert len(result.nodes) == 2
+    assert {n.node_id for n in result.nodes} == set(keep)
+
+
+def test_query_with_doc_ids_filter_matches_ref_doc_id_only():
+    # `doc_ids` filters by `ref_doc_id` (source document), not node_id.
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [
+        _make_node(f"chunk {i}", seed=i, ref_doc_id=f"src-{i // 2}")
+        for i in range(6)
+    ]
+    store.add(nodes)
+    # Two source docs: src-0 (chunks 0, 1) and src-1 (chunks 2, 3).
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64),
+        similarity_top_k=10,
+        doc_ids=["src-0", "src-1"],
+    )
+    result = store.query(q)
+    assert len(result.nodes) == 4
+    # A bare node_id passed via doc_ids does NOT match; that's what node_ids
+    # is for.
+    q2 = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64),
+        similarity_top_k=10,
+        doc_ids=[nodes[0].node_id],
+    )
+    assert store.query(q2).nodes == []
+
+
+def test_query_with_node_ids_and_filters_intersect():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [
+        _make_node(f"doc {i}", seed=i, metadata={"tier": "pro" if i % 2 else "free"})
+        for i in range(6)
+    ]
+    store.add(nodes)
+    keep = [nodes[i].node_id for i in (0, 1, 2, 3)]  # narrow to first four
+    filters = MetadataFilters(
+        filters=[MetadataFilter(key="tier", value="pro", operator=FilterOperator.EQ)]
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64),
+        similarity_top_k=10,
+        node_ids=keep,
+        filters=filters,
+    )
+    result = store.query(q)
+    # tier=="pro" → odd indices (1, 3, 5). Intersect with {0,1,2,3} → {1,3}.
+    assert {n.node_id for n in result.nodes} == {nodes[1].node_id, nodes[3].node_id}
+
+
+def test_query_ne_filter_treats_missing_key_as_no_match():
+    # Matches SimpleVectorStore reference: NE on a missing key returns False.
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [
+        _make_node("with", seed=0, metadata={"tier": "free"}),
+        _make_node("without", seed=1, metadata={}),  # no `tier` key
+    ]
+    store.add(nodes)
+    filters = MetadataFilters(
+        filters=[MetadataFilter(key="tier", value="pro", operator=FilterOperator.NE)]
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
+    )
+    result = store.query(q)
+    # Only the doc with `tier=="free"` matches (free != pro). The doc with
+    # no `tier` key is NOT a match — its key is missing.
+    assert len(result.nodes) == 1
+    assert result.nodes[0].metadata.get("tier") == "free"
+
+
+def test_query_text_match_is_case_insensitive():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [
+        _make_node("a", seed=0, metadata={"title": "The Lord of the Rings"}),
+        _make_node("b", seed=1, metadata={"title": "Lord of Light"}),
+        _make_node("c", seed=2, metadata={"title": "The Hobbit"}),
+    ]
+    store.add(nodes)
+    filters = MetadataFilters(
+        filters=[
+            MetadataFilter(key="title", value="LORD", operator=FilterOperator.TEXT_MATCH)
+        ]
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
+    )
+    result = store.query(q)
+    titles = {n.metadata["title"] for n in result.nodes}
+    assert titles == {"The Lord of the Rings", "Lord of Light"}
+
+
+def test_query_unsupported_filter_operator_raises():
+    store = _store_with_tiered_nodes()
+    # ANY is intentionally not in our supported list.
+    filters = MetadataFilters(
+        filters=[MetadataFilter(key="tier", value=["pro"], operator=FilterOperator.ANY)]
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=3, filters=filters
+    )
+    with pytest.raises(NotImplementedError):
+        store.query(q)
+
+
+# ------------------- Tier 1: protocol completeness -----------------------
+
+def test_get_raises_with_explanation():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [_make_node("a", seed=1)]
+    ids = store.add(nodes)
+    with pytest.raises(NotImplementedError, match="quantiz"):
+        store.get(ids[0])
+
+
+def test_get_nodes_by_node_ids():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [_make_node(f"doc {i}", seed=i) for i in range(3)]
+    ids = store.add(nodes)
+    fetched = store.get_nodes(node_ids=[ids[0], ids[2]])
+    assert {n.node_id for n in fetched} == {ids[0], ids[2]}
+    # Missing ids are silently skipped, matching SimpleVectorStore-ish convention.
+    fetched = store.get_nodes(node_ids=[ids[0], "nonexistent"])
+    assert {n.node_id for n in fetched} == {ids[0]}
+
+
+def test_get_nodes_by_filters():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [
+        _make_node(f"doc {i}", seed=i, metadata={"tier": "pro" if i % 2 else "free"})
+        for i in range(4)
+    ]
+    store.add(nodes)
+    filters = MetadataFilters(
+        filters=[MetadataFilter(key="tier", value="pro", operator=FilterOperator.EQ)]
+    )
+    fetched = store.get_nodes(filters=filters)
+    assert len(fetched) == 2
+    assert all(n.metadata["tier"] == "pro" for n in fetched)
+
+
+def test_get_nodes_intersects_node_ids_and_filters():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [
+        _make_node(f"doc {i}", seed=i, metadata={"tier": "pro" if i % 2 else "free"})
+        for i in range(4)
+    ]
+    ids = store.add(nodes)
+    filters = MetadataFilters(
+        filters=[MetadataFilter(key="tier", value="pro", operator=FilterOperator.EQ)]
+    )
+    fetched = store.get_nodes(node_ids=[ids[0], ids[1]], filters=filters)
+    # tier==pro is odd indices → {ids[1], ids[3]}. Intersect with {ids[0], ids[1]} → {ids[1]}.
+    assert [n.node_id for n in fetched] == [ids[1]]
+
+
+def test_get_nodes_empty_filter_returns_all():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [_make_node(f"doc {i}", seed=i) for i in range(3)]
+    store.add(nodes)
+    fetched = store.get_nodes()
+    assert len(fetched) == 3
+
+
+def test_clear_resets_store():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=2)
+    store.add([_make_node(f"doc {i}", seed=i) for i in range(3)])
+    assert len(store._nodes) == 3
+    store.clear()
+    assert len(store._nodes) == 0
+    assert len(store._index) == 0
+    # bit_width is preserved across clear; dim resets to lazy.
+    assert store._index.bit_width == 2
+    assert store._index.dim is None
+    # The cleared store is still usable.
+    store.add([_make_node("post-clear", seed=0)])
+    assert len(store._nodes) == 1
+
+
+def test_delete_nodes_with_filters():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [
+        _make_node(f"doc {i}", seed=i, metadata={"tier": "pro" if i % 2 else "free"})
+        for i in range(4)
+    ]
+    store.add(nodes)
+    filters = MetadataFilters(
+        filters=[MetadataFilter(key="tier", value="pro", operator=FilterOperator.EQ)]
+    )
+    store.delete_nodes(filters=filters)
+    assert len(store._nodes) == 2
+    assert all(data["metadata"]["tier"] == "free" for data in store._nodes.values())
+
+
+def test_delete_nodes_no_args_is_noop():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    store.add([_make_node("a", seed=1)])
+    store.delete_nodes()
+    assert len(store._nodes) == 1
+
+
+def test_to_dict_from_dict_roundtrip():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=2)
+    cfg = store.to_dict()
+    assert cfg["bit_width"] == 2
+    assert cfg["dim"] == 64
+    restored = TurboQuantVectorStore.from_dict(cfg)
+    assert restored._index.dim == 64
+    assert restored._index.bit_width == 2
+
+
+def test_to_dict_from_dict_lazy_store():
+    store = TurboQuantVectorStore(bit_width=2)
+    cfg = store.to_dict()
+    assert cfg["dim"] is None
+    restored = TurboQuantVectorStore.from_dict(cfg)
+    assert restored._index.dim is None
+    assert restored._index.bit_width == 2
+
+
+# ------------------- Tier 2: async overrides -----------------------------
+
+def test_async_add_query_delete_clear_get():
+    import asyncio
+
+    async def runner():
+        store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+        nodes = [_make_node(f"doc {i}", seed=i) for i in range(3)]
+        await store.async_add(nodes)
+        result = await store.aquery(
+            VectorStoreQuery(query_embedding=_unit_vec(0, 64), similarity_top_k=3)
+        )
+        assert len(result.nodes) == 3
+        fetched = await store.aget_nodes(node_ids=[n.node_id for n in nodes[:2]])
+        assert len(fetched) == 2
+        await store.adelete_nodes(node_ids=[nodes[0].node_id])
+        assert len(store._nodes) == 2
+        await store.aclear()
+        assert len(store._nodes) == 0
+
+    asyncio.run(runner())
+
+
+def test_async_adelete_by_ref_doc_id():
+    import asyncio
+
+    async def runner():
+        store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+        store.add([
+            _make_node("a", seed=1, ref_doc_id="parent"),
+            _make_node("b", seed=2, ref_doc_id="parent"),
+            _make_node("c", seed=3, ref_doc_id="other"),
+        ])
+        await store.adelete("parent")
+        assert len(store._nodes) == 1
+
+    asyncio.run(runner())
+
+
+# ------------------- End-to-end smoke tests: framework wiring -----------
+
+def test_vector_store_index_from_vector_store_retrieve():
+    # Smoke test: build a full VectorStoreIndex on top of our store and
+    # retrieve through it. This is the canonical way users plug a vector
+    # store into a LlamaIndex pipeline (RAG, query engine, etc.), so it
+    # exercises the index/retriever glue that calls query() on us from
+    # the framework side.
+    from llama_index.core import VectorStoreIndex, StorageContext
+    from llama_index.core.embeddings import MockEmbedding
+    from llama_index.core.schema import TextNode as LITextNode
+
+    embed_model = MockEmbedding(embed_dim=64)
+    store = TurboQuantVectorStore.from_params(bit_width=4)
+
+    # Build nodes with embeddings (MockEmbedding is deterministic).
+    nodes = []
+    for i, text in enumerate(["alpha doc", "beta doc", "gamma doc"]):
+        node = LITextNode(text=text, id_=f"n-{i}")
+        node.embedding = embed_model.get_text_embedding(text)
+        nodes.append(node)
+    store.add(nodes)
+
+    storage_context = StorageContext.from_defaults(vector_store=store)
+    index = VectorStoreIndex(nodes=[], storage_context=storage_context, embed_model=embed_model)
+    retriever = index.as_retriever(similarity_top_k=2)
+    results = retriever.retrieve("alpha")
+    assert len(results) == 2
+    # Returned NodeWithScore objects wrap our TextNodes.
+    assert all(r.score is not None for r in results)
+    contents = {r.node.get_content() for r in results}
+    assert contents.issubset({"alpha doc", "beta doc", "gamma doc"})
+
+
+def test_storage_context_persist_and_load_roundtrip(tmp_path):
+    # Smoke test: persist via StorageContext, reload via StorageContext.
+    # This is the path real LlamaIndex users follow, and it depends on
+    # our from_persist_dir + persist signature matching the framework's
+    # expectations.
+    from llama_index.core import VectorStoreIndex, StorageContext
+    from llama_index.core.embeddings import MockEmbedding
+    from llama_index.core.schema import TextNode as LITextNode
+
+    embed_model = MockEmbedding(embed_dim=64)
+    persist_dir = tmp_path / "storage"
+
+    # Build, persist.
+    store = TurboQuantVectorStore.from_params(bit_width=4)
+    nodes = []
+    for i, text in enumerate(["one", "two", "three"]):
+        node = LITextNode(text=text, id_=f"n-{i}")
+        node.embedding = embed_model.get_text_embedding(text)
+        nodes.append(node)
+    store.add(nodes)
+
+    storage_context = StorageContext.from_defaults(vector_store=store)
+    storage_context.persist(persist_dir=str(persist_dir))
+
+    # Reload via the from_persist_dir path.
+    reloaded_store = TurboQuantVectorStore.from_persist_dir(str(persist_dir))
+    assert len(reloaded_store._nodes) == 3
+    # Original query still works after reload.
+    storage_context2 = StorageContext.from_defaults(
+        vector_store=reloaded_store, persist_dir=str(persist_dir),
+    )
+    index = VectorStoreIndex(
+        nodes=[], storage_context=storage_context2, embed_model=embed_model,
+    )
+    retriever = index.as_retriever(similarity_top_k=2)
+    results = retriever.retrieve("one")
+    assert len(results) == 2

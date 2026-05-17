@@ -62,7 +62,11 @@ struct BlockedCache {
 }
 
 pub struct TurboQuantIndex {
-    dim: usize,
+    /// Vector dimensionality. `None` means the index was constructed
+    /// without a known dim (lazy mode) and hasn't seen its first add yet.
+    /// Once set — either eagerly in [`Self::new`] or implicitly on the
+    /// first [`Self::add_2d`] call — it never changes.
+    dim: Option<usize>,
     bit_width: usize,
     n_vectors: usize,
     packed_codes: Vec<u8>,
@@ -101,12 +105,15 @@ impl SearchResults {
 }
 
 impl TurboQuantIndex {
+    /// Construct an index with a known dimensionality. The dim is locked
+    /// at construction; subsequent [`Self::add`] / [`Self::add_2d`] calls
+    /// must match.
     pub fn new(dim: usize, bit_width: usize) -> Self {
         assert!((2..=4).contains(&bit_width), "bit_width must be 2, 3, or 4");
         assert!(dim % 8 == 0, "dim must be a multiple of 8");
 
         Self {
-            dim,
+            dim: Some(dim),
             bit_width,
             n_vectors: 0,
             packed_codes: Vec::new(),
@@ -117,20 +124,43 @@ impl TurboQuantIndex {
         }
     }
 
+    /// Construct an empty index without committing to a dimensionality.
+    /// The dim is inferred and locked on the first [`Self::add_2d`] call
+    /// (or [`Self::add`] if the caller wires dim in separately).
+    pub fn new_lazy(bit_width: usize) -> Self {
+        assert!((2..=4).contains(&bit_width), "bit_width must be 2, 3, or 4");
+        Self {
+            dim: None,
+            bit_width,
+            n_vectors: 0,
+            packed_codes: Vec::new(),
+            norms: Vec::new(),
+            rotation: OnceLock::new(),
+            centroids: OnceLock::new(),
+            blocked: OnceLock::new(),
+        }
+    }
+
+    /// Add a flat batch of vectors. `dim` must be set (either eagerly at
+    /// construction or by a prior [`Self::add_2d`] call). Panics otherwise.
     pub fn add(&mut self, vectors: &[f32]) {
-        let n = vectors.len() / self.dim;
+        let dim = self.dim.expect(
+            "TurboQuantIndex dim is not set; use add_2d(vectors, dim) on the \
+             first add or construct via TurboQuantIndex::new(dim, bit_width)",
+        );
+        let n = vectors.len() / dim;
         assert_eq!(
             vectors.len(),
-            n * self.dim,
+            n * dim,
             "vectors length must be a multiple of dim"
         );
 
         let rotation = self
             .rotation
-            .get_or_init(|| rotation::make_rotation_matrix(self.dim));
-        let (boundaries, _) = codebook::codebook(self.bit_width, self.dim);
+            .get_or_init(|| rotation::make_rotation_matrix(dim));
+        let (boundaries, _) = codebook::codebook(self.bit_width, dim);
         let (packed, norms) =
-            encode::encode(vectors, n, self.dim, rotation, &boundaries, self.bit_width);
+            encode::encode(vectors, n, dim, rotation, &boundaries, self.bit_width);
 
         if self.n_vectors == 0 {
             self.packed_codes = packed;
@@ -148,6 +178,27 @@ impl TurboQuantIndex {
         self.blocked = OnceLock::new();
     }
 
+    /// Add `vectors` of dimension `dim`. On a lazy index this locks the
+    /// index dim; on an already-dim'd index `dim` must match the index's
+    /// existing dim.
+    ///
+    /// This is the form that bindings with shape information (e.g. the
+    /// Python binding receiving a 2D numpy array) should use, since a
+    /// flat `&[f32]` alone is ambiguous about its shape.
+    pub fn add_2d(&mut self, vectors: &[f32], dim: usize) {
+        match self.dim {
+            Some(existing) => assert_eq!(
+                existing, dim,
+                "dim mismatch: index dim={existing}, batch dim={dim}"
+            ),
+            None => {
+                assert!(dim % 8 == 0, "dim must be a multiple of 8");
+                self.dim = Some(dim);
+            }
+        }
+        self.add(vectors);
+    }
+
     /// Run a top-`k` search against the index.
     ///
     /// Takes `&self` and is safe to call concurrently from multiple
@@ -160,23 +211,73 @@ impl TurboQuantIndex {
     /// pay that cost up front if you want deterministic first-query
     /// latency.
     pub fn search(&self, queries: &[f32], k: usize) -> SearchResults {
-        let nq = queries.len() / self.dim;
-        assert_eq!(queries.len(), nq * self.dim);
+        self.search_with_mask(queries, k, None)
+    }
+
+    /// Run a top-`k` search restricted to slots whose `mask` entry is `true`.
+    ///
+    /// `mask`, when `Some`, must have length equal to [`Self::len`]. Only
+    /// slots with `mask[i] == true` contribute to the returned top-`k`. The
+    /// effective result count per query is `min(k, n_allowed)` where
+    /// `n_allowed` is the number of `true` entries in `mask`.
+    ///
+    /// Passing `mask = None` is equivalent to [`Self::search`].
+    pub fn search_with_mask(
+        &self,
+        queries: &[f32],
+        k: usize,
+        mask: Option<&[bool]>,
+    ) -> SearchResults {
+        // A lazy index that's never seen an add returns an empty result
+        // shaped according to the caller's query count (best effort: we
+        // don't know dim, so nq is 0). Matches Python users' expectation
+        // that `search` on an empty store is a no-op rather than an error.
+        let Some(dim) = self.dim else {
+            return SearchResults {
+                scores: Vec::new(),
+                indices: Vec::new(),
+                nq: 0,
+                k: 0,
+            };
+        };
+        let nq = queries.len() / dim;
+        assert_eq!(queries.len(), nq * dim);
 
         let rotation = self
             .rotation
-            .get_or_init(|| rotation::make_rotation_matrix(self.dim));
+            .get_or_init(|| rotation::make_rotation_matrix(dim));
         let centroids = self.centroids.get_or_init(|| {
-            let (_, c) = codebook::codebook(self.bit_width, self.dim);
+            let (_, c) = codebook::codebook(self.bit_width, dim);
             c
         });
         let blocked = self.blocked.get_or_init(|| {
             let (data, n_blocks) =
-                pack::repack(&self.packed_codes, self.n_vectors, self.bit_width, self.dim);
+                pack::repack(&self.packed_codes, self.n_vectors, self.bit_width, dim);
             BlockedCache { data, n_blocks }
         });
 
-        let k = k.min(self.n_vectors);
+        let packed_mask = mask.map(|m| {
+            assert_eq!(
+                m.len(),
+                self.n_vectors,
+                "mask length {} does not match index size {}",
+                m.len(),
+                self.n_vectors,
+            );
+            let n_words = (self.n_vectors + 63) / 64;
+            let mut buf = vec![0u64; n_words];
+            for (i, &b) in m.iter().enumerate() {
+                if b {
+                    buf[i >> 6] |= 1u64 << (i & 63);
+                }
+            }
+            buf
+        });
+
+        let n_allowed = packed_mask.as_ref().map_or(self.n_vectors, |p| {
+            p.iter().map(|w| w.count_ones() as usize).sum::<usize>()
+        });
+        let effective_k = k.min(self.n_vectors).min(n_allowed);
 
         let (scores, indices) = search::search(
             queries,
@@ -186,17 +287,18 @@ impl TurboQuantIndex {
             centroids,
             &self.norms,
             self.bit_width,
-            self.dim,
+            dim,
             self.n_vectors,
             blocked.n_blocks,
             k,
+            packed_mask.as_deref(),
         );
 
         SearchResults {
             scores,
             indices,
             nq,
-            k,
+            k: effective_k,
         }
     }
 
@@ -210,24 +312,32 @@ impl TurboQuantIndex {
     ///
     /// Safe to call multiple times and from multiple threads.
     pub fn prepare(&self) {
+        // On a lazy index that's seen no add, there's nothing to prepare
+        // — dim is unknown and the caches depend on it.
+        let Some(dim) = self.dim else { return };
         self.rotation
-            .get_or_init(|| rotation::make_rotation_matrix(self.dim));
+            .get_or_init(|| rotation::make_rotation_matrix(dim));
         self.centroids.get_or_init(|| {
-            let (_, c) = codebook::codebook(self.bit_width, self.dim);
+            let (_, c) = codebook::codebook(self.bit_width, dim);
             c
         });
         self.blocked.get_or_init(|| {
             let (data, n_blocks) =
-                pack::repack(&self.packed_codes, self.n_vectors, self.bit_width, self.dim);
+                pack::repack(&self.packed_codes, self.n_vectors, self.bit_width, dim);
             BlockedCache { data, n_blocks }
         });
     }
 
     pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        // Sentinel: dim=0 in the file header means "lazy index, dim never
+        // committed". The loader interprets dim=0 + n_vectors=0 as a
+        // freshly-constructed lazy state. dim=0 is otherwise meaningless
+        // (the constructor asserts dim % 8 == 0 with dim >= 8), so this
+        // doesn't collide with any valid eager index.
         io::write(
             path,
             self.bit_width,
-            self.dim,
+            self.dim.unwrap_or(0),
             self.n_vectors,
             &self.packed_codes,
             &self.norms,
@@ -236,11 +346,12 @@ impl TurboQuantIndex {
 
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let (bit_width, dim, n_vectors, packed_codes, norms) = io::load(path)?;
-        Ok(Self::from_parts(dim, bit_width, n_vectors, packed_codes, norms))
+        let dim_opt = if dim == 0 { None } else { Some(dim) };
+        Ok(Self::from_parts(dim_opt, bit_width, n_vectors, packed_codes, norms))
     }
 
     pub(crate) fn from_parts(
-        dim: usize,
+        dim: Option<usize>,
         bit_width: usize,
         n_vectors: usize,
         packed_codes: Vec<u8>,
@@ -284,7 +395,10 @@ impl TurboQuantIndex {
             self.n_vectors
         );
 
-        let bytes_per_vec = self.dim * self.bit_width / 8;
+        // n_vectors > 0 (asserted above) implies a successful add, which
+        // implies self.dim was committed at that point. Unwrap is safe.
+        let dim = self.dim.expect("n_vectors > 0 but dim is None");
+        let bytes_per_vec = dim * self.bit_width / 8;
         let last = self.n_vectors - 1;
 
         if idx != last {
@@ -316,7 +430,18 @@ impl TurboQuantIndex {
         self.n_vectors == 0
     }
 
+    /// Vector dimensionality, or `0` if this index was constructed lazily
+    /// and hasn't seen an add yet. `0` is a safe sentinel because the
+    /// eager constructor asserts `dim >= 8` (multiple of 8). Use
+    /// [`Self::dim_opt`] when you need to distinguish "not set" from a
+    /// (nonsensical) zero.
     pub fn dim(&self) -> usize {
+        self.dim.unwrap_or(0)
+    }
+
+    /// Vector dimensionality as an [`Option`], where `None` means the
+    /// index is lazy and hasn't been committed to a dim yet.
+    pub fn dim_opt(&self) -> Option<usize> {
         self.dim
     }
 
